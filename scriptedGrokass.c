@@ -3,21 +3,16 @@
 #include <string.h>
 #include <math.h>
 
-// --- Configuration ---
 #define MAX_LINE 8192
 #define MAX_PATH 1024
 #define EPSILON 1e-6 
 
-// AUTOMATIC FOLDER CONFIGURATION
-// This tells the code to always look inside this folder for inputs
 #define DATA_FOLDER "datasets/" 
 
-// Output filenames (Written to the current folder, not datasets)
 #define OUTPUT_UA "UA_TIME.txt"
 #define OUTPUT_PA "PA_TIME.txt"
 #define OUTPUT_REB "REB_TIME.txt"
 
-// --- Structures ---
 
 typedef struct {
     double start;
@@ -272,13 +267,17 @@ void solve_cotrapmp(Dataset *ds, double theta, Role **roles_out, int *num_roles_
     int *cand_pids = NULL; int cp_cap = 0;
     int *cand_uids = NULL; int cu_cap = 0;
     int *covered_idx = NULL; int ci_cap = 0;
-    int *idx_map = calloc(ds->capacity + 5000, sizeof(int)); 
+    
+    // --- FIX START: Track capacity separately ---
+    int idx_map_cap = ds->capacity + 5000;
+    int *idx_map = calloc(idx_map_cap, sizeof(int)); 
+    // --- FIX END ---
 
     int found_any = 1;
     while (found_any) {
         found_any = 0;
         double max_coverage = -EPSILON; 
-        int min_splits = 2147483647; // Primary minimization goal
+        int min_splits = 2147483647;
         
         Role best_role = {0};
         int found_pass = 0;
@@ -419,10 +418,14 @@ void solve_cotrapmp(Dataset *ds, double theta, Role **roles_out, int *num_roles_
             int count = best_role.temp_num_covered;
 
             int current_ds_count = ds->count; 
-            if (ds->capacity + 2000 > (ds->capacity + 5000)) {
+            
+            // --- FIX START: Correct Logic for Resize ---
+            if (ds->capacity > idx_map_cap) {
                 free(idx_map);
-                idx_map = calloc(ds->capacity + 5000, sizeof(int));
+                idx_map_cap = ds->capacity + 5000;
+                idx_map = calloc(idx_map_cap, sizeof(int));
             }
+            // --- FIX END ---
 
             for(int i=0; i<count; i++) {
                 int idx = indices[i];
@@ -498,14 +501,14 @@ void write_outputs(Dataset *ds, Role *roles, int num_roles) {
 
 int main(int argc, char *argv[]) {
     if (argc < 4) { 
-        printf("Usage: %s <THETA> <UPA_FILENAME> <TIME_FILENAME>\n", argv[0]); 
+        printf("Usage: %s <UPA_FILENAME> <TIME_FILENAME>  <THETA> \n", argv[0]); 
         printf("Note: Files must be in the '%s' folder.\n", DATA_FOLDER);
         return 1; 
     }
     
-    double theta = atof(argv[1]);
     char *upa_name = argv[2];
     char *time_name = argv[3];
+    double theta = atof(argv[1]);
     
     // AUTOMATIC PATH CONSTRUCTION
     char upa_full_path[MAX_PATH];
