@@ -1,0 +1,298 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+// --- Configuration ---
+#define MAX_LINE 8192
+#define MAX_PATH 1024
+#define EPSILON 1e-6 
+
+// AUTOMATIC FOLDER CONFIGURATION
+// The code will automatically look for input files inside this folder
+#define DATA_FOLDER "datasets/" 
+
+// Output filenames (Written to the current folder)
+#define OUTPUT_UA "UA_TIME.txt"
+#define OUTPUT_PA "PA_TIME.txt"
+#define OUTPUT_REB "REB_TIME.txt"
+
+// --- Structures ---
+
+typedef struct {
+    double start;
+    double end;
+} Interval;
+
+typedef struct {
+    int uid;
+    int pid;
+    Interval t;
+    int id;         
+    int covered; // Flag to mark if this entry is currently covered
+} TupaEntry;
+
+typedef struct {
+    TupaEntry *entries;
+    int count;
+    int capacity;
+    int num_users;
+    int num_perms;
+    int **user_map;      // Lookup: user_id -> array of entry indices
+    int *user_map_counts;
+} Dataset;
+
+typedef struct {
+    int *uids;
+    int num_uids;
+    int *pids;
+    int num_pids;
+    Interval t;
+    int id;
+    
+    // Helpers for dynamic array resizing
+    int uids_capacity;
+    int pids_capacity;
+
+    // Status flag (1 = active, 0 = removed/merged)
+    int valid; 
+} Role;
+
+// --- Generic Helpers (Math & Memory) ---
+
+double max_d(double a, double b) { return (a > b) ? a : b; }
+double min_d(double a, double b) { return (a < b) ? a : b; }
+
+double duration(Interval iv) {
+    double d = iv.end - iv.start;
+    return (d < 0) ? 0.0 : d;
+}
+
+int compare_ints(const void *a, const void *b) {
+    return (*(int*)a - *(int*)b);
+}
+
+// Generic dynamic array append
+void add_to_array(int **arr, int *count, int *capacity, int val) {
+    if (*count >= *capacity) {
+        *capacity = (*capacity == 0) ? 8 : (*capacity * 2);
+        int *new_arr = realloc(*arr, *capacity * sizeof(int));
+        if (!new_arr) { perror("realloc failed"); exit(1); }
+        *arr = new_arr;
+    }
+    (*arr)[*count] = val;
+    (*count)++;
+}
+
+// Generic unique add
+void add_unique(int **arr, int *count, int *capacity, int val) {
+    for(int i=0; i<*count; i++) {
+        if ((*arr)[i] == val) return;
+    }
+    add_to_array(arr, count, capacity, val);
+}
+
+void print_progress(long current, long total) {
+    const int bar_width = 50;
+    float progress = (float)current / total;
+    if (progress > 1.0) progress = 1.0;
+    if (progress < 0.0) progress = 0.0;
+    int filled_width = (int)(bar_width * progress);
+    printf("\r[");
+    for (int i = 0; i < bar_width; ++i) {
+        if (i < filled_width) printf("#"); else printf(" ");
+    }
+    printf("] %d%% (%ld/%ld)", (int)(progress * 100.0), current, total);
+    fflush(stdout); 
+}
+
+int add_entry_to_ds(Dataset *ds, int uid, int pid, Interval t) {
+    if (ds->count >= ds->capacity) {
+        ds->capacity *= 2;
+        TupaEntry *new_entries = realloc(ds->entries, ds->capacity * sizeof(TupaEntry));
+        if (!new_entries) exit(1);
+        ds->entries = new_entries;
+    }
+    int idx = ds->count;
+    ds->entries[idx].uid = uid;
+    ds->entries[idx].pid = pid;
+    ds->entries[idx].t = t;
+    ds->entries[idx].id = idx; 
+    ds->entries[idx].covered = 0;
+    ds->count++;
+    
+    // Update User Map
+    int *bucket = ds->user_map[uid];
+    int cnt = ds->user_map_counts[uid];
+    bucket = realloc(bucket, (cnt + 1) * sizeof(int));
+    bucket[cnt] = idx;
+    ds->user_map[uid] = bucket;
+    ds->user_map_counts[uid]++;
+    
+    return idx;
+}
+
+// --- I/O Functions ---
+
+Dataset load_data(const char *upa_path, const char *time_path) {
+    Dataset ds;
+    ds.count = 0;
+    ds.capacity = 8192;
+    ds.entries = malloc(ds.capacity * sizeof(TupaEntry));
+
+    printf("Loading data from:\n  UPA:  %s\n  TIME: %s\n", upa_path, time_path);
+    FILE *f_upa = fopen(upa_path, "r");
+    FILE *f_time = fopen(time_path, "r");
+    
+    if (!f_upa || !f_time) { 
+        printf("CRITICAL ERROR: Could not open input files.\n"); 
+        if(!f_upa) printf("Failed to open: %s\n", upa_path);
+        if(!f_time) printf("Failed to open: %s\n", time_path);
+        exit(1); 
+    }
+
+    char line_upa[MAX_LINE];
+    char line_time[MAX_LINE];
+    
+    // Read headers
+    if (fgets(line_upa, MAX_LINE, f_upa)) ds.num_users = atoi(line_upa); else ds.num_users = 0;
+    if (fgets(line_upa, MAX_LINE, f_upa)) ds.num_perms = atoi(line_upa); else ds.num_perms = 0;
+    if (fgets(line_upa, MAX_LINE, f_upa)) { } // Skip 3rd line header
+    
+    ds.user_map = calloc((ds.num_users + 2), sizeof(int*));
+    ds.user_map_counts = calloc((ds.num_users + 2), sizeof(int));
+
+    while (fgets(line_upa, MAX_LINE, f_upa) && fgets(line_time, MAX_LINE, f_time)) {
+        int uid, pid;
+        if (sscanf(line_upa, "%d %d", &uid, &pid) != 2) continue;
+        
+        // Parse time intervals from the corresponding line
+        char *ptr = line_time;
+        double s, e;
+        int offset;
+        while (sscanf(ptr, "%lf %lf%n", &s, &e, &offset) == 2) {
+            Interval t = {s, e};
+            add_entry_to_ds(&ds, uid, pid, t);
+            ptr += offset;
+        }
+    }
+    fclose(f_upa);
+    fclose(f_time);
+    return ds;
+}
+
+void write_outputs(Dataset *ds, Role *roles, int num_roles) {
+    printf("Writing outputs to current directory:\n  %s\n  %s\n  %s\n", OUTPUT_UA, OUTPUT_PA, OUTPUT_REB);
+    FILE *ua = fopen(OUTPUT_UA, "w");
+    FILE *pa = fopen(OUTPUT_PA, "w");
+    FILE *reb = fopen(OUTPUT_REB, "w");
+    if(!ua || !pa || !reb) { perror("Error opening output files"); exit(1); }
+
+    // Count active roles
+    int active_roles = 0;
+    for(int i=0; i<num_roles; i++) if(roles[i].valid) active_roles++;
+
+    fprintf(ua, "%d\n%d\n", ds->num_users, active_roles);
+    fprintf(pa, "%d\n%d\n", active_roles, ds->num_perms);
+    fprintf(reb, "%d\n", active_roles);
+
+    int current_id = 1;
+    int total_pa = 0;
+    for(int i=0; i<num_roles; i++) {
+        if (!roles[i].valid) continue; 
+        
+        // Write User Assignments
+        for(int j=0; j<roles[i].num_uids; j++) fprintf(ua, "u%d r%d\n", roles[i].uids[j], current_id);
+        
+        // Write Permission Assignments
+        for(int j=0; j<roles[i].num_pids; j++) {
+            fprintf(pa, "p%d r%d\n", roles[i].pids[j], current_id);
+            total_pa++;
+        }
+        
+        // Write Role Existence Bounds (Time)
+        fprintf(reb, "r%d %.1f %.1f\n", current_id, roles[i].t.start, roles[i].t.end);
+        current_id++;
+    }
+    fclose(ua); fclose(pa); fclose(reb);
+    printf("--- Final Stats ---\n");
+    printf("|R| = %d\n", active_roles);
+    printf("|PA| + |REB| = %d\n", total_pa + active_roles);
+}
+
+// --- ALGORITHM SKELETONS ---
+
+// TODO: Implement Post-Processing
+// Should return the new count of active roles after operations
+int post_process_roles(Role *roles, int num_roles) {
+    printf("\nPost-processing roles...\n");
+    // Implement any cleaning/pruning/merging logic here
+    return num_roles;
+}
+
+// TODO: Implement Main Mining Algorithm
+void run_mining_algorithm(Dataset *ds, double theta, Role **roles_out, int *num_roles_out) {
+    printf("\nStarting Mining Algorithm...\n");
+    
+    // Initialize role array
+    int roles_capacity = 1024;
+    Role *roles = malloc(roles_capacity * sizeof(Role));
+    int num_roles = 0;
+
+    // ---------------------------------------------------------
+    // YOUR LOGIC GOES HERE
+    // Populate the 'roles' array based on the 'ds' (dataset)
+    // ---------------------------------------------------------
+
+    // Assign output
+    *roles_out = roles;
+    *num_roles_out = num_roles;
+}
+
+// --- MAIN ---
+
+int main(int argc, char *argv[]) {
+    if (argc < 4) { 
+        printf("Usage: %s <THETA> <UPA_FILENAME> <TIME_FILENAME>\n", argv[0]); 
+        printf("Note: Files must be in the '%s' folder.\n", DATA_FOLDER);
+        return 1; 
+    }
+    
+    double theta = atof(argv[1]);
+    char *upa_name = argv[2];
+    char *time_name = argv[3];
+    
+    // AUTOMATIC PATH CONSTRUCTION
+    char upa_full_path[MAX_PATH];
+    char time_full_path[MAX_PATH];
+    
+    // Combine DATA_FOLDER with filename
+    snprintf(upa_full_path, MAX_PATH, "%s%s", DATA_FOLDER, upa_name);
+    snprintf(time_full_path, MAX_PATH, "%s%s", DATA_FOLDER, time_name);
+    
+    // 1. Load Data
+    Dataset ds = load_data(upa_full_path, time_full_path);
+    
+    if (ds.count == 0) { printf("Error: Dataset empty.\n"); return 1; }
+    printf("Dataset loaded. Entries: %d\n", ds.count);
+    
+    Role *roles = NULL;
+    int num_roles = 0;
+    
+    // 2. Run Mining
+    run_mining_algorithm(&ds, theta, &roles, &num_roles);
+    
+    // 3. Post-Process
+    post_process_roles(roles, num_roles);
+
+    // 4. Write Results
+    write_outputs(&ds, roles, num_roles);
+    
+    // Cleanup
+    free(ds.entries);
+    for(int i=0; i<=ds.num_users; i++) if(ds.user_map[i]) free(ds.user_map[i]);
+    free(ds.user_map); free(ds.user_map_counts);
+    for(int i=0; i<num_roles; i++) { if(roles[i].uids) free(roles[i].uids); if(roles[i].pids) free(roles[i].pids); }
+    free(roles);
+    return 0;
+}
